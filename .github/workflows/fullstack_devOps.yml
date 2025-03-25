@@ -1,0 +1,357 @@
+# .github/workflows/main.yml
+name: Outreach-genius-github-workflow
+
+on:
+  workflow_call:
+    inputs:
+      docker_repo:
+        description: 'Docker repository name'
+        required: true
+        type: string
+      helm_repo:
+        description: 'Helm chart repository'
+        required: true
+        type: string
+      deploy_on_cluster:
+        description: 'Boolean flag to deploy on cluster'
+        required: false
+        type: boolean
+        default: true
+      trivy_scan:
+        description: 'Boolean flag to run Trivy security scan'
+        required: false
+        type: boolean
+        default: true
+      polaris_scan:
+        description: 'Boolean flag to run Polaris configuration audit'
+        required: false
+        type: boolean
+        default: true
+
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+      PERSONAL_ACCESS_TOKEN:
+        required: true
+      AWS_REGION:
+        required: true
+      EKS_CLUSTER_PROD:
+        required: true
+      EKS_CLUSTER_STAGING:
+        required: true
+      SONAR_TOKEN:
+        required: false
+      SLACK_WEBHOOK_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.set-version.outputs.VERSION }}
+      IMAGENAME: ${{ steps.image-name.outputs.IMAGENAME }}
+
+
+    steps:
+      - name: Determine Environment
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+          fi
+
+      - name: Set Snyk and SonarCloud Tokens Based on Environment
+        run: |
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            echo "SNYK_TOKEN=${{ secrets.SNYK_TOKEN_PRODUCTION }}" >> $GITHUB_ENV
+            echo "SONAR_TOKEN=${{ secrets.SONAR_TOKEN_PRODUCTION }}" >> $GITHUB_ENV
+          else
+            echo "SNYK_TOKEN=${{ secrets.SNYK_TOKEN_STAGING }}" >> $GITHUB_ENV
+            echo "SONAR_TOKEN=${{ secrets.SONAR_TOKEN_STAGING }}" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout Main Repository
+        uses: actions/checkout@v2
+        with:
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          submodules: true
+
+      - name: Lint code
+        run: npm ci && npm run lint
+
+      - name: Scan for secrets with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --verbose
+
+      - name: Run tests
+        run: npm test
+
+      - name: Dependency scan with npm
+        run: npm audit --audit-level=high || true
+
+      - name: Dependency scan with Snyk
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ env.SNYK_TOKEN }}
+        with:
+          command: test
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+        with:
+          organization: your-org
+          projectKey: your-org_your-repo
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v1
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Image Name
+        id: image-name
+        run: |
+          branch=${{ github.ref_name }}
+          if [ "$branch" == "main" ]; then
+            echo "IMAGENAME=${{ inputs.docker_repo }}-prod" >> $GITHUB_ENV
+          else
+            echo "IMAGENAME=${{ inputs.docker_repo }}" >> $GITHUB_ENV
+          fi
+          echo "::set-output name=IMAGENAME::${{ env.IMAGENAME }}"
+
+      - name: Build Docker Image
+        id: set-version
+        run: |
+          VERSION="v1.0.${{ github.run_number }}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "::set-output name=VERSION::$VERSION"
+          docker build --build-arg GITHUB_PAT=${{ secrets.PERSONAL_ACCESS_TOKEN }} --tag outreachgenius/${{ env.IMAGENAME }}:$VERSION .
+
+      - name: Push Docker Image
+        run: |
+          VERSION=${{ env.VERSION }}
+          docker push outreachgenius/${{ env.IMAGENAME }}:$VERSION
+          docker tag outreachgenius/${{ env.IMAGENAME }}:$VERSION outreachgenius/${{ env.IMAGENAME }}:latest
+          docker push outreachgenius/${{ env.IMAGENAME }}:latest
+
+      - name: Trivy Image Scan (SARIF output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: outreachgenius/${{ env.IMAGENAME }}:${{ env.VERSION }}
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy Scan SARIF Results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Send Slack alert on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ GitHub Action failed during *build-and-push* for ${{ github.repository }} on branch ${{ github.ref_name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+deploy-k8:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: ${{ inputs.deploy_on_cluster }}
+
+    steps:
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          audience: sts.amazonaws.com
+          role-to-assume: arn:aws:iam::122241224626:role/og-github-trusted-policy
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Clone Helm Repository
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ inputs.helm_repo }}
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          ref: main
+
+      - name: Determine Environment and Directory
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+            echo "DIRECTORY=production/${{ inputs.docker_repo }}" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=staging" >> $GITHUB_ENV            
+
+      - name: Checkov - Helm Chart Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ env.DIRECTORY }}
+
+      - name: Update Helm Chart values.yaml
+        run: |
+          cd ${{ env.DIRECTORY }}
+          sed -i "s/tag: .*/tag: ${{ needs.build-and-push.outputs.VERSION }}/" values.yaml
+
+      - name: Git Commit and Push
+        run: |
+          git config --local user.email "github-actions@github.com"
+          git config --local user.name "GitHub Actions"
+          git add ${{ env.DIRECTORY }}/values.yaml
+          git commit -m "Update Docker image tag to ${{ needs.build-and-push.outputs.VERSION }}"
+          git push origin main
+
+      - name: kubeconfig for EKS
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            CLUSTER_NAME="${{ secrets.EKS_CLUSTER_PROD }}"
+          else
+            CLUSTER_NAME="${{ secrets.EKS_CLUSTER_STAGING }}"
+          fi
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ secrets.AWS_REGION }}" || true
+
+      - name: Polaris Cluster Audit
+        run: |
+          curl -Lo polaris.tar.gz https://github.com/FairwindsOps/polaris/releases/download/9.5.0/polaris_linux_amd64.tar.gz
+          tar -xzf polaris.tar.gz
+          chmod +x polaris
+          sudo mv polaris /usr/local/bin/
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            NAMESPACE="production"
+          else
+            NAMESPACE="staging"
+          fi
+          polaris audit --namespace "$NAMESPACE" || true
+
+      - name: Deploy ArgoCD Application using Helm (if not exists)
+        run: |
+          APP_NAME="my-node-app"
+          EXISTING_APP=$(kubectl get application -n argocd $APP_NAME --ignore-not-found)
+          if [ -z "$EXISTING_APP" ]; then
+            echo "ArgoCD Application not found. Creating via Helm..."
+            helm upgrade --install argocd-app-${{ env.ENVIRONMENT }} ./argocd-apps \
+              --namespace argocd \
+              --set appName=$APP_NAME \
+              --set repoURL=https://github.com/your-org/your-helm-repo \
+              --set path=${{ env.DIRECTORY }} \
+              --set namespace=${{ env.ENVIRONMENT }}
+          else
+            echo "ArgoCD Application $APP_NAME already exists. Skipping creation."
+          fi
+
+      - name: Run OPA Policy Check
+        run: |
+          curl -s -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+          chmod +x opa
+          helm template myapp ${{ env.DIRECTORY }} > rendered.yaml
+          ./opa eval --format pretty --data policies/ --input rendered.yaml "data.k8s.allow"
+
+      - name: Set ZAP target URL
+        run: |
+          if [[ "$ENVIRONMENT" == "production" ]]; then
+            echo "ZAP_TARGET=https://your-prod-url.com" >> $GITHUB_ENV
+          else
+            echo "ZAP_TARGET=https://your-staging-url.com" >> $GITHUB_ENV
+          fi
+
+      - name: OWASP ZAP Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: ${{ env.ZAP_TARGET }}
+
+      - name: Send Slack alert on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          payload: |
+            {
+              "text": "❌ GitHub Action failed during *deploy-k8* for ${{ github.repository }} on branch ${{ github.ref_name }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+monitor-and-rollback:
+    runs-on: ubuntu-latest
+    needs: deploy-k8
+    if: always()
+
+    steps:
+
+      - name: Determine Environment
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            echo "ENVIRONMENT=production" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=staging" >> $GITHUB_ENV
+
+      - name: Install ArgoCD CLI & jq
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/
+          sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Monitor and Rollback ArgoCD Application
+        env:
+          APP_NAME: my-node-app
+          ENVIRONMENT: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+          MAX_ATTEMPTS: 10
+          INTERVAL: 30
+          ARGOCD_SERVER: ${{ github.ref_name == 'main' && secrets.ARGOCD_SERVER_PRODUCTION || secrets.ARGOCD_SERVER_STAGING }}
+          ARGOCD_AUTH_TOKEN: ${{ github.ref_name == 'main' && secrets.ARGOCD_AUTH_TOKEN_PRODUCTION || secrets.ARGOCD_AUTH_TOKEN_STAGING }}
+        run: |
+          ATTEMPT=1
+
+          echo "🔁 Monitoring ArgoCD application health for '$APP_NAME'..."
+
+          while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+            STATUS=$(argocd app get $APP_NAME --server $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN -o json | jq -r '.status.sync.status')
+            HEALTH=$(argocd app get $APP_NAME --server $ARGOCD_SERVER --auth-token $ARGOCD_AUTH_TOKEN -o json | jq -r '.status.health.status')
+
+            echo "🔎 Attempt $ATTEMPT/$MAX_ATTEMPTS → Sync: $STATUS | Health: $HEALTH"
+
+            if [[ "$HEALTH" == "Progressing" ]]; then
+              echo "⏳ App is still progressing. Retrying in $INTERVAL seconds..."
+              sleep $INTERVAL
+              ((ATTEMPT++))
+              continue
+            fi
+
+            if [[ "$STATUS" != "Synced" || "$HEALTH" != "Healthy" ]]; then
+              echo "❌ Deployment failed! Status: $STATUS, Health: $HEALTH"
+              echo "🔁 Triggering Git rollback..."
+
+              git config --global user.email "actions@github.com"
+              git config --global user.name "GitHub Actions"
+              git checkout main
+              git revert HEAD --no-edit
+              git push origin main
+
+              exit 0
+            fi
+
+            echo "✅ Application is Healthy and Synced!"
+            break
+          done
+
+          if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+            echo "⛔ Timeout waiting for app to become healthy. Manual intervention recommended."
+            exit 1
+          fi  

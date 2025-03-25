@@ -1,5 +1,5 @@
 # .github/workflows/main.yml
-name: github-workflow
+name: Outreach-genius-github-workflow
 
 on:
   workflow_call:
@@ -17,27 +17,44 @@ on:
         required: false
         type: boolean
         default: true
+      trivy_scan:
+        description: 'Boolean flag to run Trivy security scan'
+        required: false
+        type: boolean
+        default: true
+      polaris_scan:
+        description: 'Boolean flag to run Polaris configuration audit'
+        required: false
+        type: boolean
+        default: true
 
     secrets:
       DOCKER_USERNAME:
-        description: 'Docker Hub username'
         required: true
       DOCKER_PASSWORD:
-        description: 'Docker Hub password'
         required: true
       PERSONAL_ACCESS_TOKEN:
-        description: 'GitHub Personal Access Token'
+        required: true
+      AWS_REGION:
+        required: true
+      EKS_CLUSTER_PROD:
+        required: true
+      EKS_CLUSTER_STAGING:
         required: true
 
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.set-version.outputs.VERSION }}
+      IMAGENAME: ${{ steps.image-name.outputs.IMAGENAME }}
 
     steps:
       - name: Checkout Main Repository
         uses: actions/checkout@v2
         with:
-          submodules: true #
+          token: ${{ secrets.PERSONAL_ACCESS_TOKEN }}
+          submodules: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v1
@@ -48,20 +65,24 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Determine Image Name
+      - name: Image Name
         id: image-name
         run: |
-          if [ "${{ github.ref_name }}" == "main" ]; then
+          branch=${{ github.ref_name }}
+          if [ "$branch" == "main" ]; then
             echo "IMAGENAME=${{ inputs.docker_repo }}-prod" >> $GITHUB_ENV
           else
             echo "IMAGENAME=${{ inputs.docker_repo }}" >> $GITHUB_ENV
           fi
+          echo "::set-output name=IMAGENAME::${{ env.IMAGENAME }}"
 
       - name: Build Docker Image
+        id: set-version
         run: |
           VERSION="v1.0.${{ github.run_number }}"
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          docker build --tag outreachgenius/${{ env.IMAGENAME }}:$VERSION .
+          echo "::set-output name=VERSION::$VERSION"
+          docker build --build-arg GITHUB_PAT=${{ secrets.PERSONAL_ACCESS_TOKEN }} --tag outreachgenius/${{ env.IMAGENAME }}:$VERSION .
 
       - name: Push Docker Image
         run: |
@@ -69,13 +90,34 @@ jobs:
           docker push outreachgenius/${{ env.IMAGENAME }}:$VERSION
           docker tag outreachgenius/${{ env.IMAGENAME }}:$VERSION outreachgenius/${{ env.IMAGENAME }}:latest
           docker push outreachgenius/${{ env.IMAGENAME }}:latest
-
-      - name: Output Docker Image Version
+      
+      - name: trivy-scan
         run: |
+          echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u "${{ secrets.DOCKER_USERNAME }}" --password-stdin
+          docker run --rm \
+            -v "$(realpath .):/opt/src" \
+            -v /run/docker.sock:/var/run/docker.sock \
+            -v /tmp/trivy-cache:/cache \
+            -e "TRIVY_DB_REPOSITORY=docker.io/aquasec/trivy-db" \
+            -e "TRIVY_JAVA_DB_REPOSITORY=docker.io/aquasec/trivy-java-db" \
+            -w /opt/src \
+            aquasec/trivy:0.56.2 --cache-dir /cache image --quiet outreachgenius/${{ env.IMAGENAME }}:$VERSION || true
           echo "Docker image built and pushed with version: $VERSION"
 
+  deploy-k8:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: ${{ inputs.deploy_on_cluster }}
+
+    steps:
+      - name: Configure AWS CLI
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          audience: sts.amazonaws.com
+          role-to-assume: arn:aws:iam::122241224626:role/og-github-trusted-policy
+          aws-region: ${{ secrets.AWS_REGION }}
+
       - name: Clone Helm Repository
-        if: ${{ inputs.deploy_on_cluster }}
         uses: actions/checkout@v2
         with:
           repository: ${{ inputs.helm_repo }}
@@ -83,8 +125,6 @@ jobs:
           ref: main
 
       - name: Determine Environment and Directory
-        id: env-check
-        if: ${{ inputs.deploy_on_cluster }}
         run: |
           branch=${{ github.ref_name }}
           if [[ "$branch" == "main" ]]; then
@@ -96,16 +136,80 @@ jobs:
           fi
 
       - name: Update Helm Chart values.yaml
-        if: ${{ inputs.deploy_on_cluster }}
         run: |
           cd ${{ env.DIRECTORY }}
-          sed -i "s/tag: .*/tag: $VERSION/" values.yaml
+          echo "Updated Helm chart with version: ${{ needs.build-and-push.outputs.VERSION }}"
+          sed -i "s/tag: .*/tag: ${{ needs.build-and-push.outputs.VERSION }}/" values.yaml
+          
 
-      - name: Commit and Push Changes
-        if: ${{ inputs.deploy_on_cluster }}
+      - name: Git Commit and Push
         run: |
           git config --local user.email "github-actions@github.com"
           git config --local user.name "GitHub Actions"
           git add ${{ env.DIRECTORY }}/values.yaml
-          git commit -m "Update Docker image tag to $VERSION"
+          git commit -m "Update Docker image tag to ${{ needs.build-and-push.outputs.VERSION }}"
           git push origin main
+      
+      - name: kubeconfig for EKS
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            CLUSTER_NAME="${{ secrets.EKS_CLUSTER_PROD }}"
+          else
+            CLUSTER_NAME="${{ secrets.EKS_CLUSTER_STAGING }}"
+          fi
+          aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "${{ secrets.AWS_REGION }}" || true
+
+      - name: Polaris-scan
+        run: |
+          curl -Lo polaris.tar.gz https://github.com/FairwindsOps/polaris/releases/download/9.5.0/polaris_linux_amd64.tar.gz
+          tar -xzf polaris.tar.gz
+          chmod +x polaris
+          sudo mv polaris /usr/local/bin/
+          polaris version
+
+          LABEL_SELECTOR="app.kubernetes.io/instance=${{ inputs.docker_repo }}"
+          echo "LABEL_SELECTOR: $LABEL_SELECTOR"
+
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            NAMESPACE="production"
+          else
+            NAMESPACE="staging"
+          fi
+
+          get_resource_name() {
+            local kind="$1"
+            local label="$2"
+            local namespace="$3"
+            kubectl get "$kind" -n "$namespace" -l "$label" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo ""
+          }
+
+          POD_NAME=$(get_resource_name "pods" "$LABEL_SELECTOR" "$NAMESPACE")
+          SVC_NAME=$(get_resource_name "svc" "$LABEL_SELECTOR" "$NAMESPACE")
+          CONFIGMAP_NAME=$(get_resource_name "configmap" "$LABEL_SELECTOR" "$NAMESPACE")
+          SERVICEACCOUNT_NAME=$(get_resource_name "sa" "$LABEL_SELECTOR" "$NAMESPACE")
+
+          RESOURCES=()
+          [[ -n "$POD_NAME" ]] && RESOURCES+=("$NAMESPACE/Pod/v1/$POD_NAME")
+          [[ -n "$SVC_NAME" ]] && RESOURCES+=("$NAMESPACE/Service/v1/$SVC_NAME")
+          [[ -n "$CONFIGMAP_NAME" ]] && RESOURCES+=("$NAMESPACE/ConfigMap/v1/$CONFIGMAP_NAME")
+          [[ -n "$SERVICEACCOUNT_NAME" ]] && RESOURCES+=("$NAMESPACE/ServiceAccount/v1/$SERVICEACCOUNT_NAME")
+
+          echo "Resources: ${RESOURCES[@]}"
+          echo "Waiting for ArgoCD automatic sync (default 3 to 4 min)"
+          
+          for resource in "${RESOURCES[@]}"; do
+            echo "Auditing resource: $resource"
+            polaris audit --resource "$resource" || true
+          done
+
+      - name: Polaris-full-cluster-scan
+        run: |
+          branch=${{ github.ref_name }}
+          if [[ "$branch" == "main" ]]; then
+            NAMESPACE="production"
+          else
+            NAMESPACE="staging"
+          fi
+          polaris audit --namespace "$NAMESPACE" || true
